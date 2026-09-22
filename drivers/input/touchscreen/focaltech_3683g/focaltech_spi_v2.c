@@ -600,6 +600,12 @@ static const struct spi_device_id fts_ts_id[] = {
 };
 static const struct of_device_id fts_dt_match[] = {
     {.compatible = "focaltech,n11a-3683g-spi", },
+    /*
+     * degas names the node after the slot rather than the part, because it is
+     * shared with the goodix driver: both probe it and drop out on a chip id
+     * that is not theirs.
+     */
+    {.compatible = "xiaomi,touch-spi", },
     {},
 };
 MODULE_DEVICE_TABLE(of, fts_dt_match);
