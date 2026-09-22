@@ -591,6 +591,14 @@ static void clkchk_dump_pll_reg(bool bug_on)
 	clkchk_ops->dump_pll_reg(bug_on);
 }
 
+static void clkchk_check_apmixed_sta(bool bug_on)
+{
+	if (clkchk_ops == NULL || clkchk_ops->check_apmixed_sta == NULL)
+		return;
+
+	clkchk_ops->check_apmixed_sta(bug_on);
+}
+
 static int clk_chk_dev_pm_suspend(struct device *dev)
 {
 	struct provider_clk *pvdck = get_all_provider_clks(true);
@@ -609,7 +617,7 @@ static int clk_chk_dev_pm_suspend(struct device *dev)
 
 #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
 		aee_kernel_warning_api(__FILE__, __LINE__,
-				DB_OPT_DEFAULT, "clk-chk",
+				DB_OPT_DEFAULT | DB_OPT_FTRACE, "clk-chk",
 				"fail to disable clk/pd in suspend\n");
 #endif
 	} else {
@@ -619,9 +627,20 @@ static int clk_chk_dev_pm_suspend(struct device *dev)
 	return 0;
 }
 
+static int clk_chk_dev_pm_resume(struct device *dev)
+{
+	if (clkchk_ops == NULL || clkchk_ops->dev_pm_resume == NULL)
+		return 0;
+
+	clkchk_ops->dev_pm_resume();
+
+	return 0;
+}
+
+
 const struct dev_pm_ops clk_chk_dev_pm_ops = {
 	.suspend_noirq = clk_chk_dev_pm_suspend,
-	.resume_noirq = NULL,
+	.resume_noirq = clk_chk_dev_pm_resume,
 };
 EXPORT_SYMBOL(clk_chk_dev_pm_ops);
 
@@ -739,6 +758,9 @@ static int clkchk_evt_handling(struct notifier_block *nb,
 	case CLK_EVT_MMINFRA_HWV_TIMEOUT:
 		clkchk_dump_vlp_reg(clkd->regmap, clkd->shift);
 		break;
+	case CLK_EVT_CHECK_APMIXED_STAT:
+		clkchk_check_apmixed_sta(clkd->shift);
+		break;
 	default:
 		pr_notice("cannot get flags identify\n");
 		break;
@@ -755,7 +777,6 @@ int set_clkchk_notify(void)
 	r = register_mtk_clk_notifier(&mtk_clkchk_notifier);
 	if (r)
 		pr_err("clk-chk notifier register err(%d)\n", r);
-
 	return r;
 }
 EXPORT_SYMBOL(set_clkchk_notify);

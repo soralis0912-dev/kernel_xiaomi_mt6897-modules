@@ -18,7 +18,7 @@
 /* hw voter timeout configures */
 #define MTK_WAIT_HWV_PREPARE_CNT	100000
 #define MTK_WAIT_HWV_PREPARE_US		1
-#define MTK_WAIT_HWV_DONE_CNT		300000
+#define MTK_WAIT_HWV_DONE_CNT		5000000
 #define MTK_WAIT_HWV_DONE_US		1
 #define MTK_WAIT_HWV_STA_CNT		100
 #define MTK_HWV_ID_OFS			(0x8)
@@ -48,6 +48,7 @@ enum clk_evt_type {
 	CLK_EVT_BYPASS_PLL = 8,
 	CLK_EVT_SET_PARENT_ERR = 9,
 	CLK_EVT_MMINFRA_HWV_TIMEOUT = 10,
+	CLK_EVT_CHECK_APMIXED_STAT = 11,
 	CLK_EVT_NUM,
 };
 
@@ -228,6 +229,7 @@ void mtk_free_clk_data(struct clk_onecell_data *clk_data);
 #define MUX_ROUND_CLOSEST		BIT(21)
 #define CLK_EN_MM_INFRA_PWR		BIT(22)
 #define CLK_ENABLE_MERGE_CONTROL	BIT(23)
+#define CLK_NO_RES			BIT(24)
 
 struct mtk_pll_div_table {
 	u32 div;
