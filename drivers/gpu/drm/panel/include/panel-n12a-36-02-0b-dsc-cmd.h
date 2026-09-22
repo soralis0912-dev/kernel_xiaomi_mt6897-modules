@@ -637,5 +637,23 @@ static unsigned int range_min_qp[15] = {0, 4, 5, 5, 7, 7, 7, 7, 7, 7, 9, 9, 9, 1
 static unsigned int range_max_qp[15] = {8, 8, 9, 10, 11, 11, 11, 12, 13, 14, 15, 16, 17, 17, 19};
 static int range_bpg_ofs[15] = {2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -12, -12, -12, -12};
 
+/* per-level gamma ratios, in tenths of a percent */
+static const u32 gamma_ratio_w250[9] = {
+	0x00009efc,0x00009f90,0x00009f96,0x00009df0,0x00009e8e,0x00009e63,0x0000904b,0x0000909c,0x0000905d,
+};
+
+/* per-level gamma ratios, in tenths of a percent */
+static const u32 gamma_ratio_w1300[51] = {
+	0x0000b8c6,0x0000b939,0x0000bfa2,0x0000b7f3,0x0000b882,0x0000be7a,0x0000b77b,0x0000b7c1,0x0000bd17,0x0000b708,
+	0x0000b723,0x0000bbd5,0x0000b6b7,0x0000b6af,0x0000badc,0x0000b674,0x0000b649,0x0000ba34,0x0000b642,0x0000b60d,
+	0x0000b982,0x0000b61b,0x0000b5d2,0x0000b908,0x0000b5f0,0x0000b596,0x0000b89f,0x0000b5ce,0x0000b566,0x0000b845,
+	0x0000b5b2,0x0000b546,0x0000b7f7,0x0000b592,0x0000b51c,0x0000b7be,0x0000b56c,0x0000b4f6,0x0000b76f,0x0000b556,
+	0x0000b4dc,0x0000b745,0x0000b547,0x0000b4c1,0x0000b727,0x0000b513,0x0000b48f,0x0000b6d5,0x0000a57e,0x0000a508,
+	0x0000a5ea,
+};
+
+/* scaled white point, one six-byte RGB record per (colour, level) */
+static u8 lhbm_whitebuf[138];
+
 #endif /* _PANEL_N12A_36_02_0B_DSC_CMD_H_ */
 

@@ -36,6 +36,7 @@
 #include "../mediatek/mediatek_v2/mtk_dsi.h"
 
 #include "include/panel-n12a-36-02-0b-dsc-cmd.h"
+#include "include/panel_n12a_36_02_0b_alpha_data.h"
 
 /*
  * The stock driver picks between two initialisation tables on the panel build
@@ -58,6 +59,14 @@ static int current_fps = 60;
 static char build_id_cmdline[8];
 module_param_string(build_id, build_id_cmdline, sizeof(build_id_cmdline), 0600);
 MODULE_PARM_DESC(build_id, "build_id=<buildid_info>");
+
+static char oled_wp_cmdline[16];
+module_param_string(oled_wp, oled_wp_cmdline, sizeof(oled_wp_cmdline), 0600);
+MODULE_PARM_DESC(oled_wp, "oled_wp=<white point info>");
+
+static char oled_lhbm_cmdline[80];
+module_param_string(oled_lhbm, oled_lhbm_cmdline, sizeof(oled_lhbm_cmdline), 0600);
+MODULE_PARM_DESC(oled_lhbm, "oled_lhbm=<lhbm white param>");
 
 static inline struct lcm *panel_to_lcm(struct drm_panel *panel)
 {
@@ -611,11 +620,757 @@ static int panel_ext_reset(struct drm_panel *panel, int on)
 	return 0;
 }
 
+/*
+ * Brightness path.
+ *
+ * The panel keeps its 0x51 level in DDIC registers that do not survive the
+ * reset an ESD recovery performs, so remember the last non-zero level and put
+ * it back afterwards - restoring 0 would leave the screen dark until userspace
+ * happens to push a new level.
+ *
+ * While AOD is on the doze path owns the brightness (it drives a much smaller
+ * range), so swallow the normal updates instead of fighting it.
+ */
+static unsigned int last_non_zero_bl_level = 511;
+static atomic_t doze_enable = ATOMIC_INIT(0);
+
+static int lcm_setbacklight_cmdq(void *dsi, dcs_write_gce cb, void *handle,
+				 unsigned int level)
+{
+	char bl_tb0[] = {0x51, 0x00, 0x00};
+	struct mtk_dsi *mtk_dsi = dsi;
+	struct lcm *ctx = panel_ctx;
+
+	if (!dsi) {
+		pr_err("dsi is null\n");
+		return -EINVAL;
+	}
+	if (!cb || !ctx)
+		return -1;
+
+	if (level) {
+		bl_tb0[1] = (level >> 8) & 0xff;
+		bl_tb0[2] = level & 0xff;
+		mtk_dsi->mi_cfg.last_no_zero_bl_level = level;
+	}
+
+	if (atomic_read(&doze_enable)) {
+		pr_info("%s: Return it when aod on, %d %d %d\n", __func__,
+			level, bl_tb0[1], bl_tb0[2]);
+		return 0;
+	}
+
+	pr_info("%s %d %d %d\n", __func__, level, bl_tb0[1], bl_tb0[2]);
+
+	mutex_lock(&ctx->panel_lock);
+	cb(dsi, handle, bl_tb0, ARRAY_SIZE(bl_tb0));
+	mutex_unlock(&ctx->panel_lock);
+
+	if (level)
+		last_non_zero_bl_level = level;
+
+	mtk_dsi->mi_cfg.last_bl_level = level;
+
+	return 0;
+}
+
+static void lcm_esd_restore_backlight(struct drm_panel *panel)
+{
+	char bl_tb0[] = {0x51, 0x00, 0x00};
+	struct lcm *ctx = panel_to_lcm(panel);
+
+	bl_tb0[1] = (last_non_zero_bl_level >> 8) & 0xff;
+	bl_tb0[2] = last_non_zero_bl_level & 0xff;
+
+	pr_info("%s: restore to level = %d\n", __func__, last_non_zero_bl_level);
+
+	mutex_lock(&ctx->panel_lock);
+	lcm_dcs_write(ctx, bl_tb0, ARRAY_SIZE(bl_tb0));
+	mutex_unlock(&ctx->panel_lock);
+}
+
+static bool get_panel_initialized(struct drm_panel *panel)
+{
+	struct lcm *ctx;
+
+	if (!panel) {
+		pr_err("%s panel is NULL\n", __func__);
+		return false;
+	}
+
+	ctx = panel_to_lcm(panel);
+
+	return ctx->prepared;
+}
+
+static int panel_get_panel_info(struct drm_panel *panel, char *buf)
+{
+	struct lcm *ctx;
+
+	if (!panel || !buf) {
+		pr_err("invalid params\n");
+		return -EAGAIN;
+	}
+
+	ctx = panel_to_lcm(panel);
+
+	return snprintf(buf, PAGE_SIZE, "%s\n", ctx->panel_info);
+}
+
+static int panel_get_max_brightness_clone(struct drm_panel *panel,
+					  u32 *max_brightness_clone)
+{
+	struct lcm *ctx;
+
+	if (!panel) {
+		pr_err("invalid params\n");
+		return -EAGAIN;
+	}
+
+	ctx = panel_to_lcm(panel);
+	*max_brightness_clone = ctx->max_brightness_clone;
+
+	return 0;
+}
+
+static int panel_get_factory_max_brightness(struct drm_panel *panel,
+					    u32 *max_brightness_clone)
+{
+	struct lcm *ctx;
+
+	if (!panel) {
+		pr_err("invalid params\n");
+		return -EAGAIN;
+	}
+
+	ctx = panel_to_lcm(panel);
+	*max_brightness_clone = ctx->factory_max_brightness;
+
+	return 0;
+}
+
+/*
+ * AOD.
+ *
+ * The panel has its own low-power idle mode: doze_enable only records that we
+ * are in it (the display driver has already sent the mode change), while
+ * doze_disable takes the panel back out with DCS exit_idle_mode. Brightness in
+ * that mode is not the usual 0x51 range - it is one of two fixed levels, which
+ * is why the stock driver ships them as tables rather than a value.
+ */
+static int panel_doze_enable(struct drm_panel *panel, void *dsi,
+			     dcs_write_gce cb, void *handle)
+{
+	atomic_set(&doze_enable, 1);
+	pr_info("%s !-\n", __func__);
+
+	return 0;
+}
+
+static int panel_doze_disable(struct drm_panel *panel, void *dsi,
+			      dcs_write_gce cb, void *handle)
+{
+	char exit_idle_mode[] = {0x38, 0x00};
+
+	if (!dsi) {
+		pr_err("%s dsi is null\n", __func__);
+		return -1;
+	}
+	if (!panel) {
+		pr_err("%s invalid panel\n", __func__);
+		return -1;
+	}
+
+	pr_info("%s +\n", __func__);
+
+	cb(dsi, handle, exit_idle_mode, ARRAY_SIZE(exit_idle_mode));
+	atomic_set(&doze_enable, 0);
+
+	pr_info("%s -\n", __func__);
+
+	return 0;
+}
+
+static int panel_set_doze_brightness(struct drm_panel *panel,
+				     int doze_brightness)
+{
+	struct LCM_setting_table *table;
+	struct lcm *ctx;
+	int ret = 0;
+
+	if (!panel) {
+		pr_err("invalid params\n");
+		return -1;
+	}
+
+	ctx = panel_to_lcm(panel);
+
+	if (ctx->doze_brightness_state == doze_brightness) {
+		pr_info("%s skip same doze_brightness set:%d\n", __func__,
+			doze_brightness);
+		return 0;
+	}
+
+	/*
+	 * Userspace can ask for a doze level while the panel is running
+	 * normally; the levels only mean anything in idle mode, so record the
+	 * request and let the next doze_enable pick it up.
+	 */
+	if (!atomic_read(&doze_enable)) {
+		pr_info("%s normal mode cannot set doze brightness\n", __func__);
+		goto out;
+	}
+
+	switch (doze_brightness) {
+	case DOZE_BRIGHTNESS_LBM:
+		table = backlight_l;
+		break;
+	case DOZE_BRIGHTNESS_HBM:
+		table = backlight_h;
+		break;
+	default:
+		if (doze_brightness == DOZE_TO_NORMAL)
+			atomic_set(&doze_enable, 0);
+		goto out;
+	}
+
+	ret = mi_disp_panel_ddic_send_cmd(table, 1, false);
+	if (ret) {
+		mtk_dprec_logger_pr(0, "%s: failed to send ddic cmd\n", __func__);
+		DDPPR_ERR("%s: failed to send ddic cmd\n", __func__);
+	}
+
+out:
+	ctx->doze_brightness_state = doze_brightness;
+	pr_info("%s end -\n", __func__);
+
+	return ret;
+}
+
+static int panel_get_doze_brightness(struct drm_panel *panel,
+				     u32 *doze_brightness)
+{
+	struct lcm *ctx;
+
+	if (!panel) {
+		pr_err("invalid params\n");
+		return -EAGAIN;
+	}
+
+	ctx = panel_to_lcm(panel);
+	*doze_brightness = ctx->doze_brightness_state;
+
+	return 0;
+}
+
+/*
+ * GIR ("gamma index remap") is Xiaomi's flat/vivid tone switch. 0x5F 0x00 turns
+ * the remap on, 0x5F 0x01 takes it off again; the panel keeps the state itself,
+ * so all we have to do is remember which way we last set it for the readback.
+ */
+static int panel_set_gir_on(struct drm_panel *panel)
+{
+	struct LCM_setting_table gir_on_set[] = {
+		{0x5F, 1, {0x00} },
+	};
+	struct lcm *ctx;
+	int ret = 0;
+
+	pr_info("%s: +\n", __func__);
+
+	if (!panel) {
+		pr_err("%s: panel is NULL\n", __func__);
+		return -1;
+	}
+
+	ctx = panel_to_lcm(panel);
+	ctx->gir_status = 1;
+
+	if (!ctx->enabled)
+		pr_err("%s: panel isn't enabled\n", __func__);
+	else
+		ret = mi_disp_panel_ddic_send_cmd(gir_on_set,
+						  ARRAY_SIZE(gir_on_set), false);
+
+	return ret;
+}
+
+static int panel_set_gir_off(struct drm_panel *panel)
+{
+	struct lcm *ctx;
+	int ret = 0;
+
+	pr_info("%s: +\n", __func__);
+
+	if (!panel) {
+		pr_err("%s: panel is NULL\n", __func__);
+		return -1;
+	}
+
+	ctx = panel_to_lcm(panel);
+	ctx->gir_status = 0;
+
+	if (!ctx->enabled)
+		pr_err("%s: panel isn't enabled\n", __func__);
+	else
+		ret = mi_disp_panel_ddic_send_cmd(gir_off_settings,
+						  ARRAY_SIZE(gir_off_settings),
+						  false);
+
+	return ret;
+}
+
+static int panel_get_gir_status(struct drm_panel *panel)
+{
+	struct lcm *ctx;
+
+	if (!panel) {
+		pr_err("%s; panel is NULL\n", __func__);
+		return -1;
+	}
+
+	ctx = panel_to_lcm(panel);
+
+	return ctx->gir_status;
+}
+
+/*
+ * White point. The panel is measured on the line and the result is burned into
+ * the bootloader, which hands it over on the command line - reading it back out
+ * of the DDIC would mean a DSI read during suspend, so Xiaomi does not bother.
+ */
+static int panel_get_wp_info(struct drm_panel *panel, char *buf, size_t size)
+{
+	static u16 lux, wx, wy;
+
+	pr_info("%s: +\n", __func__);
+
+	if (lux || wx || wy) {
+		pr_info("%s: got wp info from cache\n", __func__);
+	} else if (sscanf(oled_wp_cmdline, "%04hx%04hx%04hx", &lux, &wx, &wy) == 3) {
+		pr_info("%s: got wp info from cmdline\n", __func__);
+	} else {
+		pr_err("No panel is Connected !\n");
+		pr_info("%s: get error\n", __func__);
+		return 0;
+	}
+
+	pr_info("%s: Lux=0x%04hx, Wx=0x%04hx, Wy=0x%04hx\n", __func__, lux, wx, wy);
+
+	return snprintf(buf, size, "%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx\n",
+			lux >> 8, lux & 0xff, wx >> 8, wx & 0xff,
+			wy >> 8, wy & 0xff);
+}
+
+/*
+ * LHBM - the bright ring the panel draws under the optical fingerprint sensor.
+ * The display driver needs to know how many frames to wait after asking for it
+ * before the reader may fire, and that count differs between normal and AOD.
+ */
+static int panel_fod_lhbm_init(struct mtk_dsi *dsi)
+{
+	if (!dsi) {
+		pr_info("invalid dsi point\n");
+		return -1;
+	}
+
+	pr_info("panel_fod_lhbm_init enter\n");
+
+	dsi->display_type = "primary";
+	dsi->mi_cfg.lhbm_ui_ready_delay_frame = 5;
+	dsi->mi_cfg.lhbm_ui_ready_delay_frame_aod = 7;
+	dsi->mi_cfg.local_hbm_enabled = 1;
+
+	return 0;
+}
+
+/*
+ * Backlight and ELVSS in one grouped write.
+ *
+ * ELVSS is the OLED cathode voltage: it has to track the brightness or the
+ * panel either clips the highlights or burns more power than it needs to. The
+ * display driver works out the pairing and asks for both here, and they have to
+ * land in the same frame - hence the grouped write rather than two DCS calls.
+ *
+ * The tables are static because the callback hands the pointer straight to the
+ * CMDQ packet, which is consumed after we return.
+ */
+static int lcm_set_bl_elvss_cmdq(void *dsi, dcs_grp_write_gce cb, void *handle,
+				 struct mtk_bl_ext_config *bl_config)
+{
+	static struct mtk_panel_para_table bl_tb = {3, {0x51, 0x0f, 0xff} };
+	static struct mtk_panel_para_table elvss_tb = {2, {0x83, 0xff} };
+	static struct mtk_panel_para_table bl_elvss_tb[2] = {
+		{3, {0x51, 0x0f, 0xff} },
+		{2, {0x83, 0xff} },
+	};
+	unsigned int cfg_flag, elvss_pn, level;
+
+	if (!cb)
+		return -1;
+
+	cfg_flag = bl_config->cfg_flag;
+	elvss_pn = bl_config->elvss_pn;
+
+	if (cfg_flag & BIT(0)) {
+		level = bl_config->backlight_level;
+
+		/* AOD owns the brightness, see panel_set_doze_brightness() */
+		if (atomic_read(&doze_enable)) {
+			pr_info("%s: Return it when aod on, %d %d %d\n", __func__,
+				level, (level >> 8) & 0x0f, level & 0xff);
+			if (!(cfg_flag & BIT(1)))
+				return 0;
+			goto elvss;
+		}
+
+		if (cfg_flag & BIT(1)) {
+			pr_info("%s backlight = -%d\n", __func__, level);
+			bl_elvss_tb[0].para_list[1] = (level >> 8) & 0x0f;
+			bl_elvss_tb[0].para_list[2] = level & 0xff;
+
+			pr_info("%s elvss = -%d\n", __func__, elvss_pn);
+			bl_elvss_tb[1].para_list[1] = elvss_pn | 0x80;
+
+			cb(dsi, handle, bl_elvss_tb, ARRAY_SIZE(bl_elvss_tb));
+			return 0;
+		}
+
+		pr_info("%s backlight = -%d\n", __func__, level);
+		bl_tb.para_list[1] = (level >> 8) & 0x0f;
+		bl_tb.para_list[2] = level & 0xff;
+
+		cb(dsi, handle, &bl_tb, 1);
+		return 0;
+	}
+
+	if (cfg_flag & BIT(1)) {
+elvss:
+		pr_info("%s elvss = -%d\n", __func__, elvss_pn);
+		elvss_tb.para_list[1] = elvss_pn | 0x80;
+
+		cb(dsi, handle, &elvss_tb, 1);
+	}
+
+	return 0;
+}
+
+/*
+ * Entering AOD from a running display.
+ *
+ * The sequence matters: pick the brightness for whichever AOD level is
+ * selected, push it, and only then put the panel into idle mode with DCS
+ * enter_idle_mode. Doing it the other way round makes the panel flash at the
+ * old brightness for a frame.
+ */
+static int panel_doze_suspend(struct drm_panel *panel, void *dsi,
+			      dcs_write_gce cb, void *handle)
+{
+	char aod_start[] = {0x2F, 0x01};
+	char aod_bl[] = {0x51, 0x00, 0x3D, 0x00, 0x3D, 0x07, 0xFC};
+	char enter_idle_mode[] = {0x39, 0x00};
+	struct lcm *ctx;
+
+	if (!dsi) {
+		pr_err("%s dsi is null\n", __func__);
+		return -1;
+	}
+	if (!panel) {
+		pr_err("%s invalid panel\n", __func__);
+		return -1;
+	}
+
+	ctx = panel_to_lcm(panel);
+	if (!ctx) {
+		pr_err("ctx is null\n");
+		return -1;
+	}
+
+	if (ctx->doze_suspend) {
+		pr_info("%s already suspend, skip\n", __func__);
+		goto out;
+	}
+
+	if (ctx->doze_brightness_state == DOZE_BRIGHTNESS_HBM) {
+		char hbm[] = {0x04, 0x00, 0x04, 0x00, 0x0F, 0xFF};
+
+		memcpy(&aod_bl[1], hbm, sizeof(hbm));
+	}
+
+	cb(dsi, handle, aod_start, ARRAY_SIZE(aod_start));
+	cb(dsi, handle, aod_bl, ARRAY_SIZE(aod_bl));
+	cb(dsi, handle, enter_idle_mode, ARRAY_SIZE(enter_idle_mode));
+
+	ctx->doze_suspend = true;
+	pr_info("lhbm enter aod in doze_suspend\n");
+
+out:
+	pr_info("%s !-\n", __func__);
+
+	return 0;
+}
+
+/*
+ * LHBM - the bright spot the panel draws under the optical fingerprint reader.
+ *
+ * Three things have to line up before the spot is sent:
+ *
+ *  - the alpha, i.e. how far the surrounding pixels are dimmed. That is not a
+ *    formula; it is measured per backlight step, so it comes out of a table.
+ *    Only the two ends are tabulated - in the middle the DDIC compensates well
+ *    enough on its own that the level can be used directly.
+ *
+ *  - the white point of the spot. The panel is measured on the line and the
+ *    result arrives on the kernel command line; it then gets scaled by the
+ *    per-level gamma ratios into lhbm_whitebuf, which holds one six-byte RGB
+ *    record per (colour, level) pair.
+ *
+ *  - the command table itself, picked by backlight range and by which of the
+ *    spot modes was asked for.
+ */
+#define LHBM_TYPE_WHITE_1300		0
+#define LHBM_TYPE_WHITE_250		1
+#define LHBM_TYPE_GREEN_500		2
+#define LHBM_TYPE_OFF			3
+#define LHBM_TYPE_HLPM_WHITE_1300	4
+#define LHBM_TYPE_HLPM_WHITE_250	5
+
+#define LHBM_BL_MIN			15
+#define LHBM_BL_MAX			15603
+#define LHBM_BL_INTERVAL1_MAX		1307
+#define LHBM_BL_INTERVAL2_MAX		11467
+
+/* one six-byte RGB record per (colour, level) */
+#define LHBM_WHITE_250_BASE		0
+#define LHBM_WHITE_1300_BASE		18
+
+static u16 lhbm_alpha;
+static bool lhbm_white_param_done;
+
+static int mi_disp_panel_send_lhbm(int type, int bl_level)
+{
+	static int last_bl_level;
+	struct LCM_setting_table *table;
+	unsigned int count;
+
+	if (type == LHBM_TYPE_OFF) {
+		/*
+		 * The off sequence has to put the backlight back itself: the
+		 * spot was drawn with the panel's own dimming, and leaving it
+		 * would darken the whole screen until userspace pushes a level.
+		 */
+		if (last_bl_level > LHBM_BL_INTERVAL1_MAX &&
+		    last_bl_level <= LHBM_BL_INTERVAL2_MAX) {
+			table = lhbm_off_bl_interval_2;
+			count = ARRAY_SIZE(lhbm_off_bl_interval_2);
+		} else {
+			table = lhbm_off_bl_interval_1;
+			count = ARRAY_SIZE(lhbm_off_bl_interval_1);
+		}
+
+		table[0].para_list[0] = (bl_level >> 8) & 0xff;
+		table[0].para_list[1] = bl_level & 0xff;
+
+		return mi_disp_panel_ddic_send_cmd(table, count,
+						   FORMAT_LP_MODE | FORMAT_BLOCK);
+	}
+
+	last_bl_level = bl_level;
+
+	/*
+	 * The HLPM variants need the extra leading command that takes the
+	 * panel out of low-power mode first; the normal ones start one entry
+	 * further in.
+	 */
+	if (bl_level >= LHBM_BL_MIN && bl_level <= LHBM_BL_INTERVAL1_MAX) {
+		table = lhbm_on_bl_interval_1;
+		count = ARRAY_SIZE(lhbm_on_bl_interval_1);
+	} else if (bl_level <= LHBM_BL_INTERVAL2_MAX) {
+		table = lhbm_on_bl_interval_2;
+		count = ARRAY_SIZE(lhbm_on_bl_interval_2);
+	} else if (bl_level <= LHBM_BL_MAX) {
+		table = lhbm_on_bl_interval_3;
+		count = ARRAY_SIZE(lhbm_on_bl_interval_3);
+	} else {
+		pr_info("Error--lhbm_cmd_type:%d , %d backlight is Out of range\n",
+			type, bl_level);
+		return -EINVAL;
+	}
+
+	if (type != LHBM_TYPE_HLPM_WHITE_1300 && type != LHBM_TYPE_HLPM_WHITE_250) {
+		if (type > LHBM_TYPE_GREEN_500) {
+			pr_info("Error--lhbm_cmd_type:%d , %d backlight is Out of range\n",
+				type, bl_level);
+			return -EINVAL;
+		}
+		table++;
+		count--;
+	}
+
+	return mi_disp_panel_ddic_send_cmd(table, count,
+					   FORMAT_LP_MODE | FORMAT_BLOCK);
+}
+
+/*
+ * Scale the measured white point by the per-level gamma ratios.
+ *
+ * The bootloader hands over three RGB triplets on the command line - one per
+ * spot colour - as twelve-bit values. Each has to be scaled for every
+ * brightness step the spot can be drawn at, because the panel's colour point
+ * moves with the drive current. The ratios are in tenths of a percent, hence
+ * the divide by 10000.
+ */
+static void mi_disp_panel_update_lhbm_white_param(void)
+{
+	u16 cmdline[9];
+	int ch, i;
+
+	for (i = 0; i < ARRAY_SIZE(cmdline); i++) {
+		if (sscanf(oled_lhbm_cmdline + i * 4, "%04hx", &cmdline[i]) != 1) {
+			pr_err("%s: bad oled_lhbm cmdline\n", __func__);
+			return;
+		}
+	}
+
+	pr_info("mi_disp_panel_update_lhbm_white_param cmdline_lhbm:%s\n",
+		oled_lhbm_cmdline);
+
+	for (ch = 0; ch < 3; ch++) {
+		for (i = 0; i < ARRAY_SIZE(gamma_ratio_w250) / 3; i++) {
+			u32 v = cmdline[ch] * gamma_ratio_w250[i * 3 + ch] / 10000;
+
+			lhbm_whitebuf[LHBM_WHITE_250_BASE + i * 6 + ch * 2] = v >> 8;
+			lhbm_whitebuf[LHBM_WHITE_250_BASE + i * 6 + ch * 2 + 1] = v & 0xff;
+		}
+
+		for (i = 0; i < ARRAY_SIZE(gamma_ratio_w1300) / 3; i++) {
+			u32 v = cmdline[ch + 3] * gamma_ratio_w1300[i * 3 + ch] / 10000;
+
+			lhbm_whitebuf[LHBM_WHITE_1300_BASE + i * 6 + ch * 2] = v >> 8;
+			lhbm_whitebuf[LHBM_WHITE_1300_BASE + i * 6 + ch * 2 + 1] = v & 0xff;
+		}
+	}
+
+	lhbm_white_param_done = true;
+}
+
+static u16 lhbm_lookup_alpha(int bl_level)
+{
+	int level = clamp(bl_level, LHBM_BL_MIN, LHBM_BL_MAX);
+	u32 alpha;
+
+	if (level <= LHBM_BL_INTERVAL1_MAX)
+		alpha = aa_alpha_set_80_2nit[level];
+	else if (level <= LHBM_BL_INTERVAL2_MAX)
+		alpha = level;			/* the DDIC compensates here */
+	else
+		alpha = aa_alpha_set_1600_700nit[level - (LHBM_BL_INTERVAL2_MAX + 1)];
+
+	return ((alpha & 0xff) << 8) | ((alpha >> 8) & 0xff);
+}
+
+static int panel_set_lhbm_fod(struct mtk_dsi *dsi, enum local_hbm_state lhbm_state)
+{
+	struct mi_dsi_panel_cfg *mi_cfg;
+	struct lcm *ctx;
+	int bl_level, type;
+
+	if (!dsi || !dsi->panel) {
+		pr_err("%s: panel is NULL\n", __func__);
+		return -1;
+	}
+
+	ctx = panel_to_lcm(dsi->panel);
+	if (!ctx) {
+		pr_err("ctx is null\n");
+		return -1;
+	}
+
+	if (!ctx->enabled) {
+		pr_err("%s: panel isn't enabled\n", __func__);
+		return -1;
+	}
+
+	mi_cfg = &dsi->mi_cfg;
+	bl_level = mi_cfg->last_bl_level;
+
+	switch (lhbm_state) {
+	case LOCAL_HBM_OFF_TO_NORMAL:
+	case LOCAL_HBM_OFF_TO_NORMAL_BACKLIGHT:
+	case LOCAL_HBM_OFF_TO_NORMAL_BACKLIGHT_RESTORE:
+		pr_info("LOCAL_HBM_NORMAL off\n");
+		type = LHBM_TYPE_OFF;
+		bl_level = mi_cfg->last_no_zero_bl_level;
+		ctx->lhbm_en = false;
+		return mi_disp_panel_send_lhbm(type, bl_level);
+	case LOCAL_HBM_NORMAL_WHITE_1000NIT:
+		pr_info("LOCAL_HBM_NORMAL_WHITE_1300NIT in HBM\n");
+		type = atomic_read(&doze_enable) ? LHBM_TYPE_HLPM_WHITE_1300
+						 : LHBM_TYPE_WHITE_1300;
+		break;
+	case LOCAL_HBM_NORMAL_WHITE_110NIT:
+		pr_info("LOCAL_HBM_NORMAL_WHITE_250NIT\n");
+		type = atomic_read(&doze_enable) ? LHBM_TYPE_HLPM_WHITE_250
+						 : LHBM_TYPE_WHITE_250;
+		break;
+	case LOCAL_HBM_NORMAL_GREEN_500NIT:
+		pr_info("LOCAL_HBM_NORMAL_GREEN_500NIT\n");
+		mi_cfg->dimming_state = STATE_DIM_BLOCK;
+		type = LHBM_TYPE_GREEN_500;
+		break;
+	case LOCAL_HBM_HLPM_WHITE_1000NIT:
+		pr_info("LOCAL_HBM_HLPM_WHITE_1300NIT in HBM\n");
+		type = LHBM_TYPE_HLPM_WHITE_1300;
+		break;
+	case LOCAL_HBM_HLPM_WHITE_110NIT:
+		pr_info("LOCAL_HBM_HLPM_WHITE_250NIT\n");
+		mi_cfg->dimming_state = STATE_DIM_BLOCK;
+		type = LHBM_TYPE_HLPM_WHITE_250;
+		break;
+	default:
+		/* the 750/500nit and the LLPM entries are not wired on degas */
+		return 0;
+	}
+
+	if (atomic_read(&doze_enable))
+		bl_level = mi_cfg->last_no_zero_bl_level;
+
+	lhbm_alpha = lhbm_lookup_alpha(bl_level);
+
+	if (!lhbm_white_param_done)
+		mi_disp_panel_update_lhbm_white_param();
+
+	pr_info("%s local hbm_state :%d bl_level:%d  flat_mode:%d\n", __func__,
+		type, bl_level, ctx->gir_status);
+
+	ctx->lhbm_en = true;
+
+	return mi_disp_panel_send_lhbm(type, bl_level);
+}
+
 static struct mtk_panel_funcs ext_funcs = {
 	.reset = panel_ext_reset,
 	.ext_param_set = mtk_panel_ext_param_set,
 	.ext_param_get = mtk_panel_ext_param_get,
 	.mode_switch = mode_switch,
+	.set_bl_elvss_cmdq = lcm_set_bl_elvss_cmdq,
+	.set_backlight_cmdq = lcm_setbacklight_cmdq,
+	.esd_restore_backlight = lcm_esd_restore_backlight,
+	.get_panel_initialized = get_panel_initialized,
+	.get_panel_info = panel_get_panel_info,
+	.get_panel_max_brightness_clone = panel_get_max_brightness_clone,
+	.get_panel_factory_max_brightness = panel_get_factory_max_brightness,
+	.doze_enable = panel_doze_enable,
+	.doze_disable = panel_doze_disable,
+	.doze_suspend = panel_doze_suspend,
+	.set_doze_brightness = panel_set_doze_brightness,
+	.get_doze_brightness = panel_get_doze_brightness,
+	.panel_set_gir_on = panel_set_gir_on,
+	.panel_set_gir_off = panel_set_gir_off,
+	.panel_get_gir_status = panel_get_gir_status,
+	.get_wp_info = panel_get_wp_info,
+	.panel_fod_lhbm_init = panel_fod_lhbm_init,
+	.set_lhbm_fod = panel_set_lhbm_fod,
 	.panel_poweron = lcm_panel_poweron,
 	.panel_poweroff = lcm_panel_poweroff,
 };
