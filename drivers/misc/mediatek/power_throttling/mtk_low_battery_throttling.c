@@ -25,6 +25,7 @@
 #define LVSYS_THD_VOLT_H 3100
 #define LVSYS_THD_VOLT_L 2900
 #define MAX_INT 0x7FFFFFFF
+#undef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 struct lbat_intr_tbl {

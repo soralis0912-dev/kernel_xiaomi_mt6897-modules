@@ -21,6 +21,7 @@
 #include <linux/sched.h>
 
 
+#undef MIN
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 

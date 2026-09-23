@@ -132,6 +132,7 @@ static struct nl_rpmb_send_req nl_rpmb_req;
 
 #define RPMB_NAME "rpmb"
 
+#undef MIN
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 #define RPMB_IOCTL_PROGRAM_KEY  1

@@ -361,6 +361,7 @@ struct pd_pps_status {
  * <15:0>   :: Reserved and Shall be set to zero
  */
 
+#undef RMDO
 #define RMDO(rev_maj, rev_min, ver_maj, ver_min)		\
 	((((rev_maj) & 0xf) << 28) | (((rev_min) & 0xf) << 24) |\
 	 (((ver_maj) & 0xf) << 20) | (((ver_min) & 0xf) << 16))

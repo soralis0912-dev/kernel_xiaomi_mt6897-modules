@@ -107,6 +107,7 @@
 #define DIFF_CODE_DATA_REG_BRD 0x14D00
 
 #define ABS(val) ((val < 0) ? -(val) : val)
+#undef MAX
 #define MAX(a, b) ((a > b) ? a : b)
 
 enum GTP_TEST_ITEMS {

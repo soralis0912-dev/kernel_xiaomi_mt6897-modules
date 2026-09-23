@@ -19,6 +19,7 @@
 #include <linux/proc_fs.h>
 #include "blocktag-internal.h"
 
+#undef MIN
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 #define EARA_IOCTL_MAX_SIZE 27
