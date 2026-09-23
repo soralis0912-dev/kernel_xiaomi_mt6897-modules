@@ -18,6 +18,18 @@ KERNEL_MODULES_NAME="$(basename "${KERNEL_MODULES_DIR}")"
 MODE="${MODE:-user}"
 export MODE
 
+# Stamp the build. Without --config=stamp kleaf takes two shortcuts that both
+# end up in /proc/version: stamp.bzl hardcodes the scmversion to
+# "-maybe-dirty", and _setup_env.sh gets no KLEAF_SOURCE_DATE_EPOCHS, so it
+# falls back to `git log` in ${KERNEL_DIR} - which build.config.mtk.aarch64
+# sets to kernel-5.15, a directory that does not exist in an MGKI tree. That
+# git call returns nothing, SOURCE_DATE_EPOCH becomes 0, and the kernel is
+# stamped Thu Jan 1 00:00:00 UTC 1970.
+#
+# build.sh has no hook of its own; it passes DEBUG_ARGS and SANDBOX_ARGS to
+# bazel verbatim, and only sets them itself under DEBUG=1 and SANDBOX=0.
+export SANDBOX_ARGS="${SANDBOX_ARGS:+${SANDBOX_ARGS} }--config=stamp"
+
 # _setup_env.sh prepends ROOT_DIR twice if out/ doesn't exist yet
 export OUT_DIR="${ROOT_DIR}/out"
 mkdir -p "${OUT_DIR}"
